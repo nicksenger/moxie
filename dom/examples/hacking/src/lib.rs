@@ -1,7 +1,11 @@
 use std::{cell::RefCell, rc::Rc};
 
-use futures::{channel::mpsc, future::ready, join, SinkExt, StreamExt};
-use futures_signals::signal::{Mutable, SignalExt};
+use futures::{
+    channel::mpsc,
+    future::{err, ready},
+    stream::Map,
+    Stream, StreamExt,
+};
 use mox::mox;
 use moxie_dom::{
     elements::{
@@ -25,69 +29,71 @@ pub fn begin() {
         .run_on_wake();
 }
 
+#[derive(Clone)]
 enum Msg {
     Increment,
     Decrement,
 }
 
-async fn foo<T: Clone, Msg>(
-    sender: mpsc::Sender<Msg>,
-    receiver: mpsc::Receiver<Msg>,
-    m: Mutable<T>,
-    update: impl Fn(T, Msg) -> T + 'static,
-) -> (Rc<RefCell<mpsc::Sender<Msg>>>, ()) {
-    join!(
-        ready(Rc::new(RefCell::new(sender))),
-        receiver.for_each(move |msg| {
-            m.set(update(m.get_cloned(), msg));
-            ready(())
-        })
+fn state_signal<State: 'static, Msg: 'static + Clone, OutStream>(
+    initial_state: State,
+    update: impl Fn(&State, Msg) -> State + 'static,
+    operator: impl FnOnce(mpsc::UnboundedReceiver<Msg>) -> OutStream,
+) -> (Commit<State>, Rc<impl Fn(Msg)>)
+where
+    OutStream: Stream<Item = Msg> + 'static,
+{
+    let (current_state, accessor) = state(|| initial_state);
+    let accessor_clone = accessor.clone();
+    let updater = once(|| Rc::new(update));
+    let updater_clone = updater.clone();
+
+    let s = once(|| {
+        let (action_producer, action_consumer): (
+            mpsc::UnboundedSender<Msg>,
+            mpsc::UnboundedReceiver<Msg>,
+        ) = mpsc::unbounded();
+
+        let (mut operated_action_producer, operated_action_consumer): (
+            mpsc::UnboundedSender<Msg>,
+            mpsc::UnboundedReceiver<Msg>,
+        ) = mpsc::unbounded();
+
+        let _ = load_once(move || {
+            action_consumer.for_each(move |msg| {
+                accessor.update(|cur| Some(updater_clone(cur, msg.clone())));
+                let _ = operated_action_producer.start_send(msg);
+                ready(())
+            })
+        });
+
+        let _ = load_once(move || {
+            operator(operated_action_consumer).for_each(move |msg| {
+                accessor_clone.update(|cur| Some(updater(cur, msg.clone())));
+                ready(())
+            })
+        });
+
+        Rc::new(RefCell::new(action_producer))
+    });
+
+    (
+        current_state,
+        Rc::new(move |msg| {
+            let _ = s.borrow_mut().start_send(msg);
+        }),
     )
-}
-
-fn state_signal<T: 'static + Clone, Msg: 'static>(
-    update: impl Fn(T, Msg) -> T + 'static,
-    initial_state: T,
-    buffer: usize,
-) -> (Commit<T>, Rc<impl Fn(Msg)>) {
-    let (current_state, x) = state(|| initial_state.clone());
-    let (channel, _) = state(|| {
-        let (s, r) = mpsc::channel(buffer) as (mpsc::Sender<Msg>, mpsc::Receiver<Msg>);
-        (Rc::new(RefCell::new(s)), r)
-    });
-    let m = once(|| Mutable::new(initial_state.clone()));
-
-    let _ = load_once(|| {
-        m.signal_cloned().for_each(move |v| {
-            x.update(|_| Some(v));
-            ready(())
-        })
-    });
-    let _ = load_once(|| {
-        channel.1.for_each(move |msg| {
-            m.set(update(m.get_cloned(), msg));
-            ready(())
-        })
-    });
-
-    let dispatch = once(|| {
-        Rc::new(move |msg: Msg| {
-            let _ = channel.0.borrow_mut().start_send(msg);
-        })
-    });
-
-    (current_state, dispatch)
 }
 
 #[topo::nested]
 fn root() -> Div {
     let (ct, dispatch) = state_signal(
+        0,
         |state, msg| match msg {
             Msg::Increment => state + 1,
             Msg::Decrement => state - 1,
         },
-        0,
-        20,
+        |stream| stream.filter(|_| ready(false)),
     );
     let d1 = dispatch.clone();
     let d2 = dispatch.clone();
