@@ -1,4 +1,6 @@
-use futures::future::ready;
+use std::{cell::RefCell, rc::Rc};
+
+use futures::{channel::mpsc, future::ready, join, SinkExt, StreamExt};
 use futures_signals::signal::{Mutable, SignalExt};
 use mox::mox;
 use moxie_dom::{
@@ -8,7 +10,6 @@ use moxie_dom::{
     },
     prelude::*,
 };
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -29,20 +30,53 @@ enum Msg {
     Decrement,
 }
 
-fn state_signal<T: 'static + Clone, U>(
-    update: impl Fn(T, U) -> T,
+async fn foo<T: Clone, Msg>(
+    sender: mpsc::Sender<Msg>,
+    receiver: mpsc::Receiver<Msg>,
+    m: Mutable<T>,
+    update: impl Fn(T, Msg) -> T + 'static,
+) -> (Rc<RefCell<mpsc::Sender<Msg>>>, ()) {
+    join!(
+        ready(Rc::new(RefCell::new(sender))),
+        receiver.for_each(move |msg| {
+            m.set(update(m.get_cloned(), msg));
+            ready(())
+        })
+    )
+}
+
+fn state_signal<T: 'static + Clone, Msg: 'static>(
+    update: impl Fn(T, Msg) -> T + 'static,
     initial_state: T,
-) -> (Commit<T>, Rc<impl Fn(U)>) {
-    let (current_state, state) = state(|| initial_state.clone());
+    buffer: usize,
+) -> (Commit<T>, Rc<impl Fn(Msg)>) {
+    let (current_state, x) = state(|| initial_state.clone());
+    let (channel, _) = state(|| {
+        let (s, r) = mpsc::channel(buffer) as (mpsc::Sender<Msg>, mpsc::Receiver<Msg>);
+        (Rc::new(RefCell::new(s)), r)
+    });
     let m = once(|| Mutable::new(initial_state.clone()));
+
     let _ = load_once(|| {
         m.signal_cloned().for_each(move |v| {
-            state.update(|_| Some(v));
+            x.update(|_| Some(v));
+            ready(())
+        })
+    });
+    let _ = load_once(|| {
+        channel.1.for_each(move |msg| {
+            m.set(update(m.get_cloned(), msg));
             ready(())
         })
     });
 
-    (current_state, Rc::new(move |msg: U| m.set(update(m.get_cloned(), msg))))
+    let dispatch = once(|| {
+        Rc::new(move |msg: Msg| {
+            let _ = channel.0.borrow_mut().start_send(msg);
+        })
+    });
+
+    (current_state, dispatch)
 }
 
 #[topo::nested]
@@ -53,6 +87,7 @@ fn root() -> Div {
             Msg::Decrement => state - 1,
         },
         0,
+        20,
     );
     let d1 = dispatch.clone();
     let d2 = dispatch.clone();
@@ -61,12 +96,12 @@ fn root() -> Div {
 
     root = root.child(mox! { <div>{% "hello world from moxie! ({})", &ct }</div> });
     root = root.child(mox! {
-        <button type="button" onclick={move |_| d1(Msg::Increment)}>
+        <button type="button" onclick={move |_| {d1(Msg::Increment);}}>
             "increment"
         </button>
     });
     root = root.child(mox! {
-        <button type="button" onclick={move |_| d2(Msg::Decrement)}>
+        <button type="button" onclick={move |_| {d2(Msg::Decrement);}}>
             "decrement"
         </button>
     });
