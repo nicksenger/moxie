@@ -7,7 +7,8 @@ use moxie::runtime::RunLoop;
 /// building trees of DOM nodes.
 #[must_use]
 pub struct WebRuntime {
-    inner: RunLoop<Box<dyn FnMut()>>,
+    ///
+    pub inner: RunLoop<Box<dyn FnMut()>>,
 }
 
 impl WebRuntime {
@@ -64,7 +65,8 @@ mod web_impl {
 
         /// Pass ownership of this runtime to a "loop" which runs with
         /// `requestAnimationFrame`.
-        pub fn animation_frame_scheduler(self) -> raf::AnimationFrameScheduler<Self> {
+        pub fn animation_frame_scheduler(mut self) -> raf::AnimationFrameScheduler<Self> {
+            self.inner.set_task_executor(WebSpawner);
             raf::AnimationFrameScheduler::new(self)
         }
     }

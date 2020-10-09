@@ -1,3 +1,5 @@
+use futures::future::ready;
+use futures_signals::signal::{Mutable, SignalExt};
 use mox::mox;
 use moxie_dom::{
     elements::{
@@ -6,6 +8,7 @@ use moxie_dom::{
     },
     prelude::*,
 };
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -15,20 +18,56 @@ pub fn begin() {
         tracing::error!("{:#?}", info);
     }));
 
-    tracing::info!("mounting moxie-dom to root");
-    moxie_dom::boot(document().body().unwrap(), root);
+    tracing::info!("mounting moxie-dom to root!!");
+    moxie_dom::embed::WebRuntime::new(document().body().unwrap(), root)
+        .animation_frame_scheduler()
+        .run_on_wake();
+}
+
+enum Msg {
+    Increment,
+    Decrement,
+}
+
+fn state_signal<T: 'static + Clone, U>(
+    update: impl Fn(T, U) -> T,
+    initial_state: T,
+) -> (Commit<T>, Rc<impl Fn(U)>) {
+    let (current_state, state) = state(|| initial_state.clone());
+    let m = once(|| Mutable::new(initial_state.clone()));
+    let _ = load_once(|| {
+        m.signal_cloned().for_each(move |v| {
+            state.update(|_| Some(v));
+            ready(())
+        })
+    });
+
+    (current_state, Rc::new(move |msg: U| m.set(update(m.get_cloned(), msg))))
 }
 
 #[topo::nested]
 fn root() -> Div {
-    let (count, set_count) = state(|| 0);
+    let (ct, dispatch) = state_signal(
+        |state, msg| match msg {
+            Msg::Increment => state + 1,
+            Msg::Decrement => state - 1,
+        },
+        0,
+    );
+    let d1 = dispatch.clone();
+    let d2 = dispatch.clone();
 
     let mut root = div();
 
-    root = root.child(mox! { <div>{% "hello world from moxie! ({})", &count }</div> });
+    root = root.child(mox! { <div>{% "hello world from moxie! ({})", &ct }</div> });
     root = root.child(mox! {
-        <button type="button" onclick={move |_| set_count.update(|c| Some(c + 1))}>
+        <button type="button" onclick={move |_| d1(Msg::Increment)}>
             "increment"
+        </button>
+    });
+    root = root.child(mox! {
+        <button type="button" onclick={move |_| d2(Msg::Decrement)}>
+            "decrement"
         </button>
     });
 
