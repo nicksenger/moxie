@@ -2,8 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use futures::{
     channel::mpsc,
-    future::{err, ready},
-    stream::Map,
+    future::ready,
     Stream, StreamExt,
 };
 use mox::mox;
@@ -44,15 +43,16 @@ where
     OutStream: Stream<Item = Msg> + 'static,
 {
     let (current_state, accessor) = state(|| initial_state);
-    let accessor_clone = accessor.clone();
-    let updater = once(|| Rc::new(update));
-    let updater_clone = updater.clone();
 
     let s = once(|| {
+        let updater = Rc::new(update);
+
         let (action_producer, action_consumer): (
             mpsc::UnboundedSender<Msg>,
             mpsc::UnboundedReceiver<Msg>,
         ) = mpsc::unbounded();
+        let p = Rc::new(RefCell::new(action_producer));
+        let pc = p.clone();
 
         let (mut operated_action_producer, operated_action_consumer): (
             mpsc::UnboundedSender<Msg>,
@@ -61,7 +61,7 @@ where
 
         let _ = load_once(move || {
             action_consumer.for_each(move |msg| {
-                accessor.update(|cur| Some(updater_clone(cur, msg.clone())));
+                accessor.update(|cur| Some(updater(cur, msg.clone())));
                 let _ = operated_action_producer.start_send(msg);
                 ready(())
             })
@@ -69,12 +69,12 @@ where
 
         let _ = load_once(move || {
             operator(operated_action_consumer).for_each(move |msg| {
-                accessor_clone.update(|cur| Some(updater(cur, msg.clone())));
+                let _ = pc.borrow_mut().start_send(msg);
                 ready(())
             })
         });
 
-        Rc::new(RefCell::new(action_producer))
+        p
     });
 
     (
@@ -88,19 +88,28 @@ where
 #[topo::nested]
 fn root() -> Div {
     let (ct, dispatch) = state_signal(
-        0,
+        Rc::new(RefCell::new(0)),
         |state, msg| match msg {
-            Msg::Increment => state + 1,
-            Msg::Decrement => state - 1,
+            Msg::Increment => {
+                *(state.borrow_mut()) += 1;
+                state.clone()
+            },
+            Msg::Decrement => {
+                *(state.borrow_mut()) -= 1;
+                state.clone()
+            },
         },
-        |stream| stream.filter(|_| ready(false)),
+        |stream| stream.filter(|msg| match msg {
+            Msg::Increment => ready(true),
+            Msg::Decrement => ready(false)
+        }).map(|_| Msg::Decrement),
     );
     let d1 = dispatch.clone();
     let d2 = dispatch.clone();
 
     let mut root = div();
 
-    root = root.child(mox! { <div>{% "hello world from moxie! ({})", &ct }</div> });
+    root = root.child(mox! { <div>{% "hello world from moxie! ({})", ct.borrow() }</div> });
     root = root.child(mox! {
         <button type="button" onclick={move |_| {d1(Msg::Increment);}}>
             "increment"
