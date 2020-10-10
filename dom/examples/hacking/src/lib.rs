@@ -34,9 +34,9 @@ enum Msg {
     Decrement,
 }
 
-fn state_signal<State: 'static, Msg: 'static + Clone, OutStream>(
+pub fn mox_stream<State: 'static, Msg: 'static + Clone, OutStream>(
     initial_state: State,
-    update: impl Fn(&State, Msg) -> State + 'static,
+    reducer: impl Fn(&State, Msg) -> State + 'static,
     operator: impl FnOnce(mpsc::UnboundedReceiver<Msg>) -> OutStream,
 ) -> (Commit<State>, Rc<impl Fn(Msg)>)
 where
@@ -44,8 +44,8 @@ where
 {
     let (current_state, accessor) = state(|| initial_state);
 
-    let s = once(|| {
-        let updater = Rc::new(update);
+    let dispatch = once(|| {
+        let r = Rc::new(reducer);
 
         let (action_producer, action_consumer): (
             mpsc::UnboundedSender<Msg>,
@@ -61,7 +61,7 @@ where
 
         let _ = load_once(move || {
             action_consumer.for_each(move |msg| {
-                accessor.update(|cur| Some(updater(cur, msg.clone())));
+                accessor.update(|cur| Some(r(cur, msg.clone())));
                 let _ = operated_action_producer.start_send(msg);
                 ready(())
             })
@@ -74,20 +74,17 @@ where
             })
         });
 
-        p
+        Rc::new(move |msg| {
+            let _ = p.borrow_mut().start_send(msg);
+        })
     });
 
-    (
-        current_state,
-        Rc::new(move |msg| {
-            let _ = s.borrow_mut().start_send(msg);
-        }),
-    )
+    (current_state, dispatch)
 }
 
 #[topo::nested]
 fn root() -> Div {
-    let (ct, dispatch) = state_signal(
+    let (ct, dispatch) = mox_stream(
         Rc::new(RefCell::new(0)),
         |state, msg| match msg {
             Msg::Increment => {
