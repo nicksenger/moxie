@@ -1,10 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use futures::{
-    channel::mpsc,
-    future::ready,
-    Stream, StreamExt,
-};
+use futures::{StreamExt, future::ready};
 use mox::mox;
 use moxie_dom::{
     elements::{
@@ -13,6 +9,7 @@ use moxie_dom::{
     },
     prelude::*,
 };
+use moxie_streams::mox_stream;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -32,54 +29,7 @@ pub fn begin() {
 enum Msg {
     Increment,
     Decrement,
-}
-
-pub fn mox_stream<State: 'static, Msg: 'static + Clone, OutStream>(
-    initial_state: State,
-    reducer: impl Fn(&State, Msg) -> State + 'static,
-    operator: impl FnOnce(mpsc::UnboundedReceiver<Msg>) -> OutStream,
-) -> (Commit<State>, Rc<impl Fn(Msg)>)
-where
-    OutStream: Stream<Item = Msg> + 'static,
-{
-    let (current_state, accessor) = state(|| initial_state);
-
-    let dispatch = once(|| {
-        let r = Rc::new(reducer);
-
-        let (action_producer, action_consumer): (
-            mpsc::UnboundedSender<Msg>,
-            mpsc::UnboundedReceiver<Msg>,
-        ) = mpsc::unbounded();
-        let p = Rc::new(RefCell::new(action_producer));
-        let pc = p.clone();
-
-        let (mut operated_action_producer, operated_action_consumer): (
-            mpsc::UnboundedSender<Msg>,
-            mpsc::UnboundedReceiver<Msg>,
-        ) = mpsc::unbounded();
-
-        let _ = load_once(move || {
-            action_consumer.for_each(move |msg| {
-                accessor.update(|cur| Some(r(cur, msg.clone())));
-                let _ = operated_action_producer.start_send(msg);
-                ready(())
-            })
-        });
-
-        let _ = load_once(move || {
-            operator(operated_action_consumer).for_each(move |msg| {
-                let _ = pc.borrow_mut().start_send(msg);
-                ready(())
-            })
-        });
-
-        Rc::new(move |msg| {
-            let _ = p.borrow_mut().start_send(msg);
-        })
-    });
-
-    (current_state, dispatch)
+    Double,
 }
 
 #[topo::nested]
@@ -95,11 +45,15 @@ fn root() -> Div {
                 *(state.borrow_mut()) -= 1;
                 state.clone()
             },
+            Msg::Double => {
+                *(state.borrow_mut()) *= 2;
+                state.clone()
+            }
         },
         |stream| stream.filter(|msg| match msg {
             Msg::Increment => ready(true),
-            Msg::Decrement => ready(false)
-        }).map(|_| Msg::Decrement),
+            _ => ready(false)
+        }).map(|_| Msg::Double),
     );
     let d1 = dispatch.clone();
     let d2 = dispatch.clone();
